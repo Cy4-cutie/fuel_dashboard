@@ -315,3 +315,8 @@ with tab4:
         file_name="fuel_dashboard_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    import streamlit as st
+import pandas as pd
+
+sheet_url = st.secrets["google"]["sheet_url"]
+df = pd.read_csv(sheet_url)
