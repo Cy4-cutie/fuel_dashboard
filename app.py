@@ -1,10 +1,12 @@
 import importlib.util
 import logging
+import re
 from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Fuel Consumption Dashboard", layout="wide")
@@ -33,6 +35,32 @@ def parse_dates(s: pd.Series) -> pd.Series:
     return out
 
 
+def to_number(s: pd.Series) -> pd.Series:
+    """Handles '6,564.49', '  217.80 ', '(25.00)' (negative) and '-' (blank)."""
+    t = s.astype(str).str.strip()
+    neg = t.str.startswith("(") & t.str.endswith(")")
+    t = t.str.replace(r"[^\d.\-]", "", regex=True)
+    out = pd.to_numeric(t, errors="coerce")
+    return out.where(~neg, -out)
+
+
+def to_csv_url(url: str, sheet_name: str = "Fuel_Log") -> str:
+    """Turn any Google Sheets link into a link that returns CSV for one tab."""
+    url = url.strip()
+    if "output=csv" in url or "tqx=out:csv" in url:
+        return url
+    if "/spreadsheets/d/e/" in url:  # 'Publish to web' link (the tab is chosen by gid)
+        base, _, query = url.partition("?")
+        base = base.replace("/pubhtml", "/pub")
+        params = [p for p in query.split("&") if p and not p.startswith(("output=", "single="))]
+        return base + "?" + "&".join(params + ["output=csv"])
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", url)
+    if m:  # normal share / address-bar link (sheet must be shared 'Anyone with the link')
+        return (f"https://docs.google.com/spreadsheets/d/{m.group(1)}"
+                f"/gviz/tq?tqx=out:csv&sheet={sheet_name}")
+    return url
+
+
 def clean_fuel_log(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     df.columns = df.columns.astype(str).str.strip()
@@ -40,14 +68,20 @@ def clean_fuel_log(raw: pd.DataFrame) -> pd.DataFrame:
 
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
+        if any("JATEL GROUP FUEL MANAGEMENT" in c.upper() for c in df.columns):
+            raise ValueError(
+                "This is one of the daily tabs (e.g. 28.09.26), not the Fuel_Log tab. "
+                "Run consolidateFuelData in Apps Script, then use the Fuel_Log tab."
+            )
         raise ValueError(
-            f"Missing column(s): {', '.join(missing)}. "
-            f"Columns found: {', '.join(df.columns)}"
+            f"Missing column(s): {', '.join(missing)}. This should be the Fuel_Log tab. "
+            f"Columns found: {', '.join(df.columns[:10])}"
         )
 
     df["Date"] = parse_dates(df["Date"])
-    for c in ("Litres", "Cost"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ("Litres", "Cost", "Unit_Price_KSH/L"):
+        if c in df.columns:
+            df[c] = to_number(df[c])
 
     df = df.dropna(subset=REQUIRED)
     df = df[df["Litres"] > 0].copy()
@@ -60,9 +94,20 @@ def clean_fuel_log(raw: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner="Loading data...")
 def load_fuel_log(source) -> pd.DataFrame:
-    """source = uploaded file bytes, or a CSV URL."""
-    buf = BytesIO(source) if isinstance(source, bytes) else source
-    return clean_fuel_log(pd.read_csv(buf, thousands=","))
+    """source = uploaded file bytes, or a Google Sheets / CSV link."""
+    if isinstance(source, bytes):
+        content = source
+    else:
+        resp = requests.get(to_csv_url(source), timeout=30)
+        resp.raise_for_status()
+        content = resp.content
+        head = content[:200].lstrip().lower()
+        if head.startswith((b"<!doctype", b"<html", b"<")):
+            raise ValueError(
+                "Google returned a web page instead of CSV. Share the sheet as "
+                "'Anyone with the link - Viewer', and make sure a tab named Fuel_Log exists."
+            )
+    return clean_fuel_log(pd.read_csv(BytesIO(content), dtype=str))
 
 
 def simulated_data() -> pd.DataFrame:
@@ -147,20 +192,29 @@ def to_excel(sheets: dict) -> bytes:
 # Data input
 # ---------------------------------------------------------------------------
 st.sidebar.title("📥 Data Input")
-uploaded_file = st.sidebar.file_uploader("Upload Fuel_Log CSV", type=["csv"])
+
+# Default link from Streamlit secrets:  [google]  sheet_url = "https://docs.google.com/..."
+try:
+    secret_url = str(st.secrets["google"]["sheet_url"]).strip()
+except Exception:
+    secret_url = ""
+
+uploaded_file = st.sidebar.file_uploader("Upload Fuel_Log CSV (Fuel_Log tab only)", type=["csv"])
 sheet_url = st.sidebar.text_input(
-    "...or Fuel_Log CSV link (optional)",
-    help="For a sheet shared as 'Anyone with the link': "
-         "https://docs.google.com/spreadsheets/d/<SHEET_ID>/gviz/tq?tqx=out:csv&sheet=Fuel_Log",
+    "...or paste your Google Sheet link",
+    help="Any normal link to the spreadsheet works. The sheet must be shared as "
+         "'Anyone with the link - Viewer' and have a tab named Fuel_Log.",
 )
+if st.sidebar.button("🔄 Refresh data"):
+    st.cache_data.clear()
 
 try:
     if uploaded_file is not None:
         df_all = load_fuel_log(uploaded_file.getvalue())
-        st.success(f"✅ Loaded {len(df_all):,} fuel records.")
-    elif sheet_url.strip():
-        df_all = load_fuel_log(sheet_url.strip())
-        st.success(f"✅ Loaded {len(df_all):,} fuel records from the link.")
+        st.success(f"✅ Loaded {len(df_all):,} fuel records from the uploaded file.")
+    elif sheet_url.strip() or secret_url:
+        df_all = load_fuel_log(sheet_url.strip() or secret_url)
+        st.success(f"✅ Loaded {len(df_all):,} fuel records from Google Sheets.")
     else:
         st.sidebar.info("No data source given. Using simulated data.")
         df_all = simulated_data()
@@ -315,8 +369,3 @@ with tab4:
         file_name="fuel_dashboard_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    import streamlit as st
-import pandas as pd
-
-sheet_url = st.secrets["google"]["sheet_url"]
-df = pd.read_csv(sheet_url)
